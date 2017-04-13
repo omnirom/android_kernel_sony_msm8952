@@ -15,8 +15,7 @@
 
 # Android makefile to build kernel as a part of Android Build
 
-ifeq ($(BUILD_KERNEL),true)
-ifeq ($(filter-out loire suzu,$(TARGET_DEVICE)),)
+ifeq ($(filter-out suzu kugo,$(TARGET_DEVICE)),)
 
 KERNEL_SRC := $(call my-dir)
 # kernel configuration - mandatory:
@@ -185,5 +184,4 @@ kernelconfig: $(KERNEL_OUT) $(KERNEL_CONFIG)
 $(PRODUCT_OUT)/kernel: $(KERNEL_BIN)
 	cp $(KERNEL_BIN) $(PRODUCT_OUT)/kernel
 
-endif # Sony AOSP devices
-endif # BUILD_KERNEL
+endif # suzu and kugo

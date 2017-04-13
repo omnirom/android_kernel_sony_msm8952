@@ -64,6 +64,7 @@
 #include <linux/serial_core.h>
 #include <linux/platform_data/msm_serial_hs.h>
 
+#include <net/bluetooth/bluesleep.h>
 #include <net/bluetooth/bluetooth.h>
 #include <net/bluetooth/hci_core.h> /* event notifications */
 #include "hci_uart.h"
@@ -86,13 +87,6 @@
 #define BT_PORT_ID	0
 
 #define BT_BLUEDROID_SUPPORT 1
-/*
-When Line discipline driver is interfacing with bluesleep,
-LPM  enabling is not through bluesleep_write_proc_lpm().
-uport setting need to be done in bluesleep_start().
-*********TO DO****** change macro to conf entry*/
-#define BT_BLUEDROID_V4L2_SUPPORT 1
-
 enum {
 	DEBUG_USER_STATE = 1U << 0,
 	DEBUG_SUSPEND = 1U << 1,
@@ -148,19 +142,11 @@ DECLARE_DELAYED_WORK(sleep_workqueue, bluesleep_sleep_work);
 #define PROC_LPM	4
 #define PROC_BTWRITE	5
 
-static bool has_lpm_enabled;
-
 static struct platform_device *bluesleep_uart_dev;
 static struct bluesleep_info *bsi;
 
 /* module usage */
-static atomic_t open_count = ATOMIC_INIT(1);
-
-/*
- * Local function prototypes
- */
-/*static*/ int bluesleep_start(void);
-/*static*/ void bluesleep_stop(void);
+static atomic_t open_count = ATOMIC_INIT(0);
 
 /*
  * Global variables
@@ -172,7 +158,7 @@ static unsigned long flags;
 /** Tasklet to respond to change in hostwake line */
 static struct tasklet_struct hostwake_task;
 
-#if BT_BLUEDROID_V4L2_SUPPORT
+#if defined(CONFIG_LINE_DISCIPLINE_DRIVER)
 /** Transmission timer */
 static void bluesleep_tx_timer_expire(unsigned long data);
 static DEFINE_TIMER(tx_timer, bluesleep_tx_timer_expire, 0, 0);
@@ -180,6 +166,9 @@ static DEFINE_TIMER(tx_timer, bluesleep_tx_timer_expire, 0, 0);
 
 /** Lock for state transitions */
 static spinlock_t rw_lock;
+
+/** State variable: whether uart clock is turned on by bluesleep. */
+static atomic_t uart_is_on = ATOMIC_INIT(0);
 
 struct proc_dir_entry *bluetooth_dir, *sleep_dir;
 
@@ -189,14 +178,18 @@ struct proc_dir_entry *bluetooth_dir, *sleep_dir;
 
 static void hsuart_power(int on)
 {
+	int ret = 0;
+
 	if (test_bit(BT_SUSPEND, &flags))
 		return;
-	if (on) {
+	if (on && atomic_read(&uart_is_on) == 0) {
 		msm_hs_request_clock_on(bsi->uport);
 		msm_hs_set_mctrl(bsi->uport, TIOCM_RTS);
-	} else {
+		atomic_inc(&uart_is_on);
+	} else if (!on && atomic_read(&uart_is_on) == 1) {
 		msm_hs_set_mctrl(bsi->uport, 0);
 		msm_hs_request_clock_off(bsi->uport);
+		atomic_set(&uart_is_on, 0);
 	}
 }
 
@@ -299,16 +292,15 @@ static void bluesleep_hostwake_task(unsigned long data)
  * Handles proper timer action when outgoing data is delivered to the
  * HCI line discipline. Sets BT_TXDATA.
  */
-/*static*/ void bluesleep_outgoing_data(void)
+void bluesleep_outgoing_data(void)
 {
 	unsigned long irq_flags;
 	int power_on_uart = 0;
 
 	spin_lock_irqsave(&rw_lock, irq_flags);
 
-#if BT_BLUEDROID_V4L2_SUPPORT
-	if (!test_bit(BT_TXDATA, &flags))
-		mod_timer(&tx_timer, jiffies + (TX_TIMER_INTERVAL * HZ));
+#if defined(CONFIG_LINE_DISCIPLINE_DRIVER)
+	mod_timer(&tx_timer, jiffies + (TX_TIMER_INTERVAL * HZ));
 	set_bit(BT_TXDATA, &flags);
 #endif
 
@@ -342,7 +334,7 @@ EXPORT_SYMBOL(bluesleep_outgoing_data);
  * Function to check wheather bluetooth can sleep when btwrite was deasserted
  * by bluedroid.
  */
-static void bluesleep_tx_allow_sleep(void)
+void bluesleep_tx_allow_sleep(void)
 {
 	unsigned long irq_flags;
 
@@ -353,15 +345,22 @@ static void bluesleep_tx_allow_sleep(void)
 
 	spin_lock_irqsave(&rw_lock, irq_flags);
 
+#ifdef CONFIG_LINE_DISCIPLINE_DRIVER
+	mod_timer(&tx_timer, jiffies + (TX_TIMER_INTERVAL*HZ));
+	clear_bit(BT_TXDATA, &flags);
+#else
 	if (bsi->has_ext_wake == 1)
 		gpio_set_value(bsi->ext_wake, 0);
 	set_bit(BT_EXT_WAKE, &flags);
+
 	bluesleep_tx_idle();
+#endif
 
 	spin_unlock_irqrestore(&rw_lock, irq_flags);
 }
+EXPORT_SYMBOL(bluesleep_tx_allow_sleep);
 
-#if BT_BLUEDROID_V4L2_SUPPORT
+#if defined(CONFIG_LINE_DISCIPLINE_DRIVER)
 /**
  * Handles reception timer expiration.
  * @param data Not used.
@@ -414,16 +413,15 @@ static irqreturn_t bluesleep_hostwake_isr(int irq, void *dev_id)
  * @return On success, 0. On error, -1, and <code>errno</code> is set
  * appropriately.
  */
-/*static*/ int bluesleep_start(void)
+int bluesleep_start(bool is_clock_enabled)
 {
 	unsigned long irq_flags;
 
-#if BT_BLUEDROID_V4L2_SUPPORT
-	if (!has_lpm_enabled) {
-		has_lpm_enabled  = true;
-		bsi->uport = msm_hs_get_uart_port(BT_PORT_ID);
+	if (atomic_read(&open_count) != 0) {
+		return -EBUSY;
 	}
-#endif
+	atomic_inc(&open_count);
+
 	spin_lock_irqsave(&rw_lock, irq_flags);
 
 	if (test_bit(BT_PROTO, &flags)) {
@@ -431,26 +429,28 @@ static irqreturn_t bluesleep_hostwake_isr(int irq, void *dev_id)
 		return 0;
 	}
 
-	spin_unlock_irqrestore(&rw_lock, irq_flags);
-
-	if (!atomic_dec_and_test(&open_count)) {
-		atomic_inc(&open_count);
-		return -EBUSY;
-	}
-
-	spin_lock_irqsave(&rw_lock, irq_flags);
-
 	/* assert BT_WAKE */
 	if (debug_mask & DEBUG_BTWAKE)
 		pr_err("BT WAKE: set to wake\n");
 	if (bsi->has_ext_wake == 1)
 		gpio_set_value(bsi->ext_wake, 1);
 	clear_bit(BT_EXT_WAKE, &flags);
-	set_bit(BT_ASLEEP, &flags);
-#if BT_BLUEDROID_V4L2_SUPPORT
+
+#if defined(CONFIG_LINE_DISCIPLINE_DRIVER)
 	clear_bit(BT_TXDATA, &flags);
 #endif
+
+	clear_bit(BT_ASLEEP, &flags);
+
 	spin_unlock_irqrestore(&rw_lock, irq_flags);
+
+	// For ldisc-controlled BT, the clock is enabled by upper layers, so
+	// make bluesleep aware of this state.
+	if(is_clock_enabled) {
+		atomic_set(&uart_is_on, 1);
+	} else {
+		hsuart_power(HS_UART_ON);
+	}
 
 	enable_wakeup_irq(1);
 	set_bit(BT_PROTO, &flags);
@@ -462,7 +462,7 @@ EXPORT_SYMBOL(bluesleep_start);
 /**
  * Stops the Sleep-Mode Protocol on the Host.
  */
-/*static*/ void bluesleep_stop(void)
+void bluesleep_stop(void)
 {
 	unsigned long irq_flags;
 
@@ -481,7 +481,7 @@ EXPORT_SYMBOL(bluesleep_start);
 	set_bit(BT_EXT_WAKE, &flags);
 	clear_bit(BT_PROTO, &flags);
 
-#if BT_BLUEDROID_V4L2_SUPPORT
+#if defined(CONFIG_LINE_DISCIPLINE_DRIVER)
 	del_timer(&tx_timer);
 #endif
 
@@ -493,14 +493,14 @@ EXPORT_SYMBOL(bluesleep_start);
 		spin_unlock_irqrestore(&rw_lock, irq_flags);
 	}
 
-	atomic_inc(&open_count);
+#if defined(CONFIG_LINE_DISCIPLINE_DRIVER)
+	atomic_set(&uart_is_on, 0);
+#endif
+
+	atomic_dec(&open_count);
 
 	enable_wakeup_irq(0);
 	wake_lock_timeout(&bsi->wake_lock, HZ / 2);
-#if BT_BLUEDROID_V4L2_SUPPORT
-	has_lpm_enabled = false;
-	bsi->uport = NULL;
-#endif
 }
 EXPORT_SYMBOL(bluesleep_stop);
 
@@ -655,7 +655,9 @@ static int bluesleep_probe(struct platform_device *pdev)
 		goto free_bt_ext_wake;
 	}
 
-	enable_wakeup_irq(0);
+	bsi->uport = msm_hs_get_uart_port(BT_PORT_ID);
+
+	atomic_set(&bsi->wakeup_irq_disabled, 1);
 	return 0;
 
 free_bt_ext_wake:
@@ -686,14 +688,14 @@ static int bluesleep_resume(struct platform_device *pdev)
 	if (test_bit(BT_SUSPEND, &flags)) {
 		if (debug_mask & DEBUG_SUSPEND)
 			pr_info("bluesleep resuming...\n");
-		if ((bsi->uport != NULL) &&
+		clear_bit(BT_SUSPEND, &flags);
+
+		if (atomic_read(&open_count) == 1 &&
 			(gpio_get_value(bsi->host_wake) == bsi->irq_polarity)) {
 			if (debug_mask & DEBUG_SUSPEND)
 				pr_info("bluesleep resume from BT event...\n");
-			msm_hs_request_clock_on(bsi->uport);
-			msm_hs_set_mctrl(bsi->uport, TIOCM_RTS);
+			hsuart_power(HS_UART_ON);
 		}
-		clear_bit(BT_SUSPEND, &flags);
 	}
 	return 0;
 }
@@ -727,8 +729,8 @@ static int bluesleep_proc_show(struct seq_file *m, void *v)
 {
 	switch ((long)m->private) {
 	case PROC_LPM:
-		seq_printf(m, "lpm: %u\n",
-				test_bit(has_lpm_enabled, &flags) ? 1 : 0);
+		seq_printf(m, "lpm: %d\n",
+				atomic_read(&open_count) == 0 ? 1 : 0);
 		break;
 	case PROC_BTWRITE:
 		seq_printf(m, "btwrite: %u\n",
@@ -759,16 +761,9 @@ static ssize_t bluesleep_proc_write(struct file *file, const char *buf,
 		if (lbuf[0] == '0') {
 			/* HCI_DEV_UNREG */
 			bluesleep_stop();
-			has_lpm_enabled = false;
-			bsi->uport = NULL;
 		} else {
 			/* HCI_DEV_REG */
-			if (!has_lpm_enabled) {
-				has_lpm_enabled = true;
-				bsi->uport = msm_hs_get_uart_port(BT_PORT_ID);
-				/* if bluetooth started, start bluesleep*/
-				bluesleep_start();
-			}
+			bluesleep_start(0);
 		}
 		break;
 	case PROC_BTWRITE:
@@ -864,7 +859,7 @@ static int __init bluesleep_init(void)
 
 	/* Initialize spinlock. */
 	spin_lock_init(&rw_lock);
-#if BT_BLUEDROID_V4L2_SUPPORT
+#if defined(CONFIG_LINE_DISCIPLINE_DRIVER)
 	/* Initialize timer */
 	init_timer(&tx_timer);
 	tx_timer.function = bluesleep_tx_timer_expire;
@@ -896,7 +891,7 @@ static void __exit bluesleep_exit(void)
 		if (disable_irq_wake(bsi->host_wake_irq))
 			pr_err("Couldn't disable hostwake IRQ wakeup mode");
 		free_irq(bsi->host_wake_irq, NULL);
-#if BT_BLUEDROID_V4L2_SUPPORT
+#if defined(CONFIG_LINE_DISCIPLINE_DRIVER)
 		del_timer(&tx_timer);
 #endif
 		if (!test_bit(BT_ASLEEP, &flags))
